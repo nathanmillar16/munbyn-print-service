@@ -1,0 +1,38 @@
+# Add these automations to Home Assistant (or merge them into automations.yaml).
+# Put matching random values in secrets.yaml and the print service's .env:
+#   munbyn_printer_wake_webhook_id: "<same as HA_WAKE_WEBHOOK_ID>"
+#   munbyn_printer_sleep_webhook_id: "<same as HA_SLEEP_WEBHOOK_ID>"
+#
+# Keep local_only enabled and do not expose Home Assistant webhook URLs publicly.
+
+- id: munbyn_printer_power_on
+  alias: Munbyn printer - power on for print service
+  description: Turns on the printer smart plug when the local print service requests it.
+  trigger:
+    - platform: webhook
+      webhook_id: !secret munbyn_printer_wake_webhook_id
+      allowed_methods:
+        - POST
+      local_only: true
+  condition: []
+  action:
+    - service: switch.turn_on
+      target:
+        entity_id: switch.munbyn_label_printer_plug_power
+  mode: single
+
+- id: munbyn_printer_power_off
+  alias: Munbyn printer - power off after print service idle timeout
+  description: Turns off the printer smart plug after the service confirms the CUPS queue is idle.
+  trigger:
+    - platform: webhook
+      webhook_id: !secret munbyn_printer_sleep_webhook_id
+      allowed_methods:
+        - POST
+      local_only: true
+  condition: []
+  action:
+    - service: switch.turn_off
+      target:
+        entity_id: switch.munbyn_label_printer_plug_power
+  mode: single

@@ -31,6 +31,23 @@ A small LAN web page for submitting existing 4 x 6 inch PDF labels to the Ubuntu
 
 5. Open `http://<ubuntu-server-ip>:8088` from a computer on the home network. Paste a multiline customer address into the address box and choose **Fill address fields**, or enter the fields manually. Check the parsed fields, preview the label, and confirm printing. You can also upload an existing carrier PDF. The address form has editable Instagram, Facebook, and website details prefilled with Little Rose's current values; changes are remembered in that browser. The local webpage does not ask for the token. The service uses the queue's confirmed 4 x 6 option, `PageSize=w288h432`.
 
+### Optional Home Assistant power control
+
+The printer power feature is disabled until all three `HA_*` settings in `.env` are filled in. With it enabled, the service calls the wake webhook before submitting a job, waits for the configured startup delay, and keeps the printer on while CUPS has queued or printing jobs. It calls the sleep webhook only after CUPS has remained clear for the configured idle timeout. If CUPS cannot be checked, the service leaves the printer powered.
+
+Copy `.env.example` to `.env` and set:
+
+- `HA_BASE_URL`: the Home Assistant URL reachable **from inside the print-service container** (for example, `http://192.168.0.20:8123`; do not use `localhost` unless Home Assistant shares the container network).
+- `HA_WAKE_WEBHOOK_ID` and `HA_SLEEP_WEBHOOK_ID`: two different random webhook IDs. Keep them secret and use the same values in Home Assistant's `secrets.yaml`.
+- `PRINTER_STARTUP_DELAY_SECONDS`: time to wait after waking the printer (default 15 seconds).
+- `PRINTER_IDLE_TIMEOUT_SECONDS`: how long the CUPS queue must stay empty before switching off (default 120 seconds).
+- `PRINTER_STATUS_POLL_SECONDS`: how often to check CUPS (default 5 seconds).
+- `HA_WEBHOOK_TIMEOUT_SECONDS`: webhook request timeout (default 10 seconds).
+
+Add the two example automations from `home-assistant/munbyn-printer-power.yaml` to Home Assistant and put the webhook IDs in `secrets.yaml`. Both automations are restricted to local requests. Keep Home Assistant's webhook URLs off the public internet. The sample targets `switch.munbyn_label_printer_plug_power`.
+
+The startup delay and idle timeout are adjustable. CUPS completion indicates queue status, not verified physical output. Test that the ITPP941 starts printing after power is restored before relying on the plug-controlled workflow.
+
 Keep port 8088 available only on the trusted home network. Do not forward it from the internet. If UFW is enabled, allow only your LAN subnet, replacing the example subnet with the one used at home:
 
 ```bash

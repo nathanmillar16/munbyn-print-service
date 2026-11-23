@@ -1,9 +1,15 @@
+import asyncio
 import hmac
 import io
+import logging
 import os
 import re
 import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.request
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -18,10 +24,72 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
-app = FastAPI(title="Little Rose Label Printer", docs_url=None, redoc_url=None)
 PRINT_TOKEN = os.environ.get("PRINT_WEB_TOKEN", "")
 MAX_PDF_BYTES = 20 * 1024 * 1024
 QUEUE = os.environ.get("CUPS_QUEUE", "munbyn")
+
+HA_BASE_URL = os.environ.get("HA_BASE_URL", "").strip().rstrip("/")
+HA_WAKE_WEBHOOK_ID = os.environ.get("HA_WAKE_WEBHOOK_ID", "").strip()
+HA_SLEEP_WEBHOOK_ID = os.environ.get("HA_SLEEP_WEBHOOK_ID", "").strip()
+POWER_SETTINGS = (HA_BASE_URL, HA_WAKE_WEBHOOK_ID, HA_SLEEP_WEBHOOK_ID)
+if any(POWER_SETTINGS) and not all(POWER_SETTINGS):
+    raise RuntimeError("Configure HA_BASE_URL and both Home Assistant webhook IDs, or leave all three empty")
+
+HA_POWER_CONTROL_ENABLED = all(POWER_SETTINGS)
+PRINTER_STARTUP_DELAY_SECONDS = float(os.environ.get("PRINTER_STARTUP_DELAY_SECONDS", "15"))
+PRINTER_IDLE_TIMEOUT_SECONDS = float(os.environ.get("PRINTER_IDLE_TIMEOUT_SECONDS", "120"))
+PRINTER_STATUS_POLL_SECONDS = float(os.environ.get("PRINTER_STATUS_POLL_SECONDS", "5"))
+HA_WEBHOOK_TIMEOUT_SECONDS = float(os.environ.get("HA_WEBHOOK_TIMEOUT_SECONDS", "10"))
+
+if PRINTER_STARTUP_DELAY_SECONDS < 0:
+    raise RuntimeError("PRINTER_STARTUP_DELAY_SECONDS must be zero or greater")
+if PRINTER_IDLE_TIMEOUT_SECONDS < 0:
+    raise RuntimeError("PRINTER_IDLE_TIMEOUT_SECONDS must be zero or greater")
+if PRINTER_STATUS_POLL_SECONDS <= 0:
+    raise RuntimeError("PRINTER_STATUS_POLL_SECONDS must be greater than zero")
+if HA_WEBHOOK_TIMEOUT_SECONDS <= 0:
+    raise RuntimeError("HA_WEBHOOK_TIMEOUT_SECONDS must be greater than zero")
+
+if HA_POWER_CONTROL_ENABLED:
+    ha_url = urlsplit(HA_BASE_URL)
+    if ha_url.scheme not in {"http", "https"} or not ha_url.hostname or ha_url.path not in {"", "/"} or ha_url.query or ha_url.fragment or ha_url.username or ha_url.password:
+        raise RuntimeError("HA_BASE_URL must be an http(s) Home Assistant base URL without credentials, path, query, or fragment")
+    for webhook_id in (HA_WAKE_WEBHOOK_ID, HA_SLEEP_WEBHOOK_ID):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", webhook_id):
+            raise RuntimeError("Home Assistant webhook IDs must be 16–128 letters, digits, underscores, or hyphens")
+
+logger = logging.getLogger("munbyn_power")
+printer_power_lock = asyncio.Lock()
+printer_power_manager_task = None
+printer_is_awake = False
+power_off_armed = False
+queue_idle_since = None
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    global printer_power_manager_task
+    if HA_POWER_CONTROL_ENABLED:
+        printer_power_manager_task = asyncio.create_task(
+            manage_printer_power(), name="munbyn-printer-power-manager"
+        )
+    try:
+        yield
+    finally:
+        if printer_power_manager_task:
+            printer_power_manager_task.cancel()
+            try:
+                await printer_power_manager_task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(
+    title="Little Rose Label Printer",
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
 
 
 class AddressLabelRequest(BaseModel):
@@ -179,6 +247,101 @@ def build_address_label_pdf(
     return create_address_label(address, brand_details)
 
 
+def _post_home_assistant_webhook(webhook_id: str, action: str) -> None:
+    request = urllib.request.Request(
+        f"{HA_BASE_URL}/api/webhook/{webhook_id}",
+        data=b"",
+        headers={"Content-Length": "0"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HA_WEBHOOK_TIMEOUT_SECONDS) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"Home Assistant {action} webhook returned HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Home Assistant {action} webhook returned HTTP {error.code}") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RuntimeError(f"Could not reach the Home Assistant {action} webhook") from None
+
+
+async def call_home_assistant_webhook(webhook_id: str, action: str) -> None:
+    await asyncio.to_thread(_post_home_assistant_webhook, webhook_id, action)
+
+
+async def submit_bytes_with_power(data: bytes, copies: int):
+    global printer_is_awake, power_off_armed, queue_idle_since
+
+    async with printer_power_lock:
+        if HA_POWER_CONTROL_ENABLED:
+            if not printer_is_awake:
+                try:
+                    await call_home_assistant_webhook(HA_WAKE_WEBHOOK_ID, "wake")
+                except RuntimeError as error:
+                    raise HTTPException(status_code=503, detail=str(error)) from None
+                if PRINTER_STARTUP_DELAY_SECONDS > 0:
+                    await asyncio.sleep(PRINTER_STARTUP_DELAY_SECONDS)
+                printer_is_awake = True
+
+            # Arm shutdown before submitting. If CUPS rejects the job, the printer
+            # still returns to its idle/off state after the configured delay.
+            power_off_armed = True
+            queue_idle_since = None
+
+        return await asyncio.to_thread(submit_bytes, data, copies)
+
+
+async def manage_printer_power() -> None:
+    global printer_is_awake, power_off_armed, queue_idle_since
+
+    while True:
+        await asyncio.sleep(PRINTER_STATUS_POLL_SECONDS)
+        if not power_off_armed:
+            continue
+
+        try:
+            active_jobs = await asyncio.to_thread(read_jobs, "not-completed")
+        except Exception:
+            logger.warning("Could not read CUPS queue; keeping the printer powered")
+            continue
+
+        if active_jobs:
+            queue_idle_since = None
+            continue
+
+        if queue_idle_since is None:
+            queue_idle_since = time.monotonic()
+            continue
+        if time.monotonic() - queue_idle_since < PRINTER_IDLE_TIMEOUT_SECONDS:
+            continue
+
+        async with printer_power_lock:
+            if not power_off_armed:
+                continue
+            try:
+                active_jobs = await asyncio.to_thread(read_jobs, "not-completed")
+            except Exception:
+                logger.warning("Could not recheck CUPS queue; keeping the printer powered")
+                continue
+
+            if active_jobs:
+                queue_idle_since = None
+                continue
+            if queue_idle_since is None or time.monotonic() - queue_idle_since < PRINTER_IDLE_TIMEOUT_SECONDS:
+                continue
+
+            try:
+                await call_home_assistant_webhook(HA_SLEEP_WEBHOOK_ID, "sleep")
+            except RuntimeError as error:
+                logger.warning("%s; will retry after another idle interval", error)
+                queue_idle_since = time.monotonic()
+                continue
+
+            power_off_armed = False
+            printer_is_awake = False
+            queue_idle_since = None
+            logger.info("Printer powered off after the CUPS queue stayed idle")
+
+
 def authorize(authorization: str | None) -> None:
     expected = f"Bearer {PRINT_TOKEN}"
     if authorization is None or not hmac.compare_digest(authorization, expected):
@@ -326,7 +489,7 @@ async def submit_pdf(pdf: UploadFile, copies: int):
     if not data.startswith(b"%PDF-"):
         raise HTTPException(status_code=415, detail="The uploaded file is not a valid PDF")
 
-    return submit_bytes(data, copies)
+    return await submit_bytes_with_power(data, copies)
 
 
 def submit_bytes(data: bytes, copies: int):
@@ -383,7 +546,7 @@ async def print_address_from_page(
     label_pdf = build_address_label_pdf(
         name, address_line_1, address_line_2, town, county, postcode, instagram, facebook, website
     )
-    return submit_bytes(label_pdf, copies)
+    return await submit_bytes_with_power(label_pdf, copies)
 
 
 @app.post("/api/preview-address")
@@ -411,7 +574,7 @@ async def preview_address_from_page(
 
 
 @app.post("/api/print-address-api")
-def print_address_api(payload: AddressLabelRequest, authorization: str | None = Header(default=None)):
+async def print_address_api(payload: AddressLabelRequest, authorization: str | None = Header(default=None)):
     """Authenticated server-to-server endpoint for printing the branded address label."""
     authorize(authorization)
     if not 1 <= payload.copies <= 10:
@@ -427,7 +590,7 @@ def print_address_api(payload: AddressLabelRequest, authorization: str | None = 
         payload.facebook,
         payload.website,
     )
-    return submit_bytes(label_pdf, payload.copies)
+    return await submit_bytes_with_power(label_pdf, payload.copies)
 
 
 @app.get("/api/print-jobs/{job_id}")
