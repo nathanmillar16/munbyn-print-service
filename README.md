@@ -1,6 +1,6 @@
 # Little Rose Munbyn print service
 
-A small LAN web page for submitting existing 4 x 6 inch PDF labels to the Ubuntu CUPS queue named `munbyn`. The service runs in Docker and submits jobs through the host CUPS Unix socket; the Ubuntu Munbyn driver remains responsible for rendering the PDF.
+A small LAN web page for Little Rose 57 x 32 mm branded stickers, address labels, and existing 4 x 6 inch PDFs. The service runs in Docker and submits jobs through the host CUPS Unix socket; the Ubuntu Munbyn driver remains responsible for rendering the PDF.
 
 ## Install on the Ubuntu printer server
 
@@ -29,7 +29,9 @@ A small LAN web page for submitting existing 4 x 6 inch PDF labels to the Ubuntu
    docker compose logs -f
    ```
 
-5. Open `http://<ubuntu-server-ip>:8088` from a computer on the home network. Paste a multiline customer address into the address box and choose **Fill address fields**, or enter the fields manually. Check the parsed fields, preview the label, and confirm printing. You can also upload an existing carrier PDF. The address form has editable Instagram, Facebook, and website details prefilled with Little Rose's current values; changes are remembered in that browser. The local webpage does not ask for the token. The service uses the queue's confirmed 4 x 6 option, `PageSize=w288h432`.
+5. Open `http://<ubuntu-server-ip>:8088` from a computer on the home network. The sticker editor lets you type a short message, drag the monochrome badge and message into place on a 57 x 32 mm preview, resize both, and review the generated PDF before printing. For 4 x 6 address labels, paste a multiline customer address and choose **Fill address fields**, or enter the fields manually. You can also upload an existing carrier PDF. Address label details are remembered in that browser. The local webpage does not ask for the token. Shipping labels keep the queue's confirmed 4 x 6 option, `PageSize=w288h432`; sticker jobs use CUPS media option `Custom.57x32mm`.
+
+The CUPS queue must support custom media for sticker printing. Check its media options with `lpoptions -p munbyn -l`; the `PageSize` option should list `Custom`. If it is not listed, add a 57 x 32 mm custom media size to the host CUPS queue/driver before printing stickers. Load the matching 57 x 32 mm roll and confirm a single test sticker is aligned before printing a batch.
 
 ### Optional Home Assistant power control
 
@@ -56,7 +58,7 @@ sudo ufw allow from 192.168.0.0/24 to any port 8088 proto tcp
 
 ## API routes
 
-The local address form previews through `POST /api/preview-address`, then submits to `POST /api/print-address` after the user confirms. The service generates the branded 4 x 6 PDF in memory and sends it to CUPS without retaining the generated file. The existing PDF upload submits to `POST /api/print-from-page`. These page endpoints are intended for the trusted home network and check that browser submissions come from the same origin. Address labels require ReportLab and the DejaVu fonts, which the Docker image installs during rebuild.
+The sticker editor previews through `POST /api/preview-sticker`, then submits to `POST /api/print-sticker` after the user confirms. Sticker design is sent as a monochrome badge, message, element positions, and sizes; the service creates a 57 x 32 mm PDF in memory and submits it using `media=Custom.57x32mm`. The local address form previews through `POST /api/preview-address`, then submits to `POST /api/print-address` after the user confirms. The service generates the branded 4 x 6 PDF in memory and sends it to CUPS without retaining the generated file. The existing PDF upload submits to `POST /api/print-from-page`. These page endpoints are intended for the trusted home network and check that browser submissions come from the same origin. PDFs use ReportLab and the DejaVu fonts, which the Docker image installs during rebuild.
 
 The page reads `GET /api/status` every five seconds to show whether the printer is idle, printing, or paused, along with queued jobs and up to five completed jobs retained by CUPS.
 
