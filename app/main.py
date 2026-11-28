@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import io
+import json
 import logging
 import math
 import os
@@ -13,12 +14,15 @@ import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
+from typing import Literal
+from uuid import uuid4
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from reportlab.lib.colors import black
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -107,6 +111,47 @@ class AddressLabelRequest(BaseModel):
     website: str = "www.littlerose.shop"
     copies: int = 1
 
+class StickerElementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=40)
+    type: Literal["badge", "text"]
+    x_mm: float = Field(ge=0, le=57)
+    y_mm: float = Field(ge=0, le=32)
+    size_mm: float = Field(default=14, ge=6, le=27)
+    text: str = Field(default="", max_length=56)
+    width_mm: float = Field(default=30, ge=8, le=53)
+    font_size_pt: float = Field(default=8, ge=5, le=14)
+    align: Literal["left", "center", "right"] = "center"
+
+
+class StickerDesignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    elements: list[StickerElementRequest] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_elements(self):
+        ids = [element.id for element in self.elements]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Sticker elements need unique IDs")
+        if sum(element.type == "badge" for element in self.elements) > 1:
+            raise ValueError("A sticker can contain at most one Little Rose badge")
+        return self
+
+
+class StickerTemplateRequest(StickerDesignRequest):
+    name: str = Field(min_length=1, max_length=60)
+
+
+class StickerTemplate(StickerTemplateRequest):
+    id: str
+
+
+class StickerPrintRequest(StickerDesignRequest):
+    copies: int = Field(default=1, ge=1, le=10)
+
+
 if len(PRINT_TOKEN) < 32:
     raise RuntimeError("PRINT_WEB_TOKEN must be configured with at least 32 characters")
 
@@ -115,6 +160,8 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 PAGE_WIDTH, PAGE_HEIGHT = 288, 432  # 4 x 6 inches, matching the Munbyn queue setting.
 STICKER_WIDTH_MM, STICKER_HEIGHT_MM = 57, 32
 STICKER_WIDTH, STICKER_HEIGHT = STICKER_WIDTH_MM / 25.4 * 72, STICKER_HEIGHT_MM / 25.4 * 72
+STICKER_TEMPLATE_FILE = Path(os.environ.get("STICKER_TEMPLATE_FILE", "/data/sticker-templates.json"))
+sticker_template_lock = RLock()
 FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 pdfmetrics.registerFont(TTFont("DejaVu", str(FONT_DIR / "DejaVuSans.ttf")))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", str(FONT_DIR / "DejaVuSans-Bold.ttf")))
@@ -250,87 +297,118 @@ def build_address_label_pdf(
     return create_address_label(address, brand_details)
 
 
-def create_sticker_pdf(
-    message: str,
-    logo_x_mm: float,
-    logo_y_mm: float,
-    logo_size_mm: float,
-    text_x_mm: float,
-    text_y_mm: float,
-    text_size_pt: float,
-) -> bytes:
-    """Create a user-positioned Little Rose logo sticker for 57 x 32 mm stock."""
-    message = clean_field(message, "Sticker message", required=True, limit=56)
-    if not message.strip():
-        raise HTTPException(status_code=400, detail="Sticker message is required")
-    if any(not math.isfinite(value) for value in (logo_x_mm, logo_y_mm, logo_size_mm, text_x_mm, text_y_mm, text_size_pt)):
-        raise HTTPException(status_code=400, detail="Sticker layout values must be finite numbers")
-    if not 0 <= logo_x_mm <= STICKER_WIDTH_MM or not 0 <= text_x_mm <= STICKER_WIDTH_MM:
-        raise HTTPException(status_code=400, detail="Sticker elements must stay within the label width")
-    if not 0 <= logo_y_mm <= STICKER_HEIGHT_MM or not 0 <= text_y_mm <= STICKER_HEIGHT_MM:
-        raise HTTPException(status_code=400, detail="Sticker elements must stay within the label height")
-    if not 6 <= logo_size_mm <= 27:
-        raise HTTPException(status_code=400, detail="Logo size must be between 6 and 27 mm")
-    if not 5 <= text_size_pt <= 14:
-        raise HTTPException(status_code=400, detail="Message size must be between 5 and 14 points")
-
+def create_sticker_pdf(elements: list[StickerElementRequest]) -> bytes:
+    """Render the editor's element model to a 57 x 32 mm thermal label PDF."""
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=(STICKER_WIDTH, STICKER_HEIGHT), pageCompression=1)
     pdf.setTitle("Little Rose custom sticker")
     pdf.setAuthor("Little Rose")
     pdf.setFillColor(black)
-
-    logo_size = logo_size_mm / 25.4 * 72
-    logo_x = logo_x_mm / 25.4 * 72
-    logo_y = STICKER_HEIGHT - logo_y_mm / 25.4 * 72
-    if logo_x - logo_size / 2 < 2 / 25.4 * 72 or logo_x + logo_size / 2 > STICKER_WIDTH - 2 / 25.4 * 72:
-        raise HTTPException(status_code=400, detail="Move the badge away from the label edge")
-    if logo_y - logo_size / 2 < 2 / 25.4 * 72 or logo_y + logo_size / 2 > STICKER_HEIGHT - 2 / 25.4 * 72:
-        raise HTTPException(status_code=400, detail="Move the badge away from the label edge")
-
+    margin = 2 / 25.4 * 72
     logo = Path(__file__).parent / "static" / "little-rose-badge-mono.png"
-    pdf.drawImage(
-        ImageReader(str(logo)),
-        logo_x - logo_size / 2,
-        logo_y - logo_size / 2,
-        width=logo_size,
-        height=logo_size,
-        mask="auto",
-    )
 
-    text_x = text_x_mm / 25.4 * 72
-    text_y = STICKER_HEIGHT - text_y_mm / 25.4 * 72
-    max_text_width = 30 / 25.4 * 72
-    words = message.split()
-    lines = []
-    line = ""
-    for word in words:
-        candidate = f"{line} {word}".strip()
-        if line and pdfmetrics.stringWidth(candidate, "DejaVu-Bold", text_size_pt) > max_text_width:
+    for element in elements:
+        values = (element.x_mm, element.y_mm, element.size_mm, element.width_mm, element.font_size_pt)
+        if any(not math.isfinite(value) for value in values):
+            raise HTTPException(status_code=400, detail="Sticker layout values must be finite numbers")
+        center_x = element.x_mm / 25.4 * 72
+        center_y = STICKER_HEIGHT - element.y_mm / 25.4 * 72
+
+        if element.type == "badge":
+            size = element.size_mm / 25.4 * 72
+            if center_x - size / 2 < margin or center_x + size / 2 > STICKER_WIDTH - margin:
+                raise HTTPException(status_code=400, detail="Move the badge away from the label edge")
+            if center_y - size / 2 < margin or center_y + size / 2 > STICKER_HEIGHT - margin:
+                raise HTTPException(status_code=400, detail="Move the badge away from the label edge")
+            pdf.drawImage(
+                ImageReader(str(logo)),
+                center_x - size / 2,
+                center_y - size / 2,
+                width=size,
+                height=size,
+                mask="auto",
+            )
+            continue
+
+        text = clean_field(element.text, "Sticker text", required=True, limit=56)
+        font_size = element.font_size_pt
+        text_width = element.width_mm / 25.4 * 72
+        left_x, right_x = center_x - text_width / 2, center_x + text_width / 2
+        if left_x < margin or right_x > STICKER_WIDTH - margin:
+            raise HTTPException(status_code=400, detail="Move the text box away from the label edge")
+
+        lines = []
+        line = ""
+        for word in text.split():
+            candidate = f"{line} {word}".strip()
+            if line and pdfmetrics.stringWidth(candidate, "DejaVu-Bold", font_size) > text_width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        if line:
             lines.append(line)
-            line = word
-        else:
-            line = candidate
-    if line:
-        lines.append(line)
-    if len(lines) > 3 or any(pdfmetrics.stringWidth(part, "DejaVu-Bold", text_size_pt) > max_text_width for part in lines):
-        raise HTTPException(status_code=400, detail="Shorten the message or reduce its size to fit the sticker")
+        if len(lines) > 4 or any(pdfmetrics.stringWidth(part, "DejaVu-Bold", font_size) > text_width for part in lines):
+            raise HTTPException(status_code=400, detail="Shorten the text or reduce its size to fit the sticker")
 
-    line_height = text_size_pt * 1.18
-    total_height = line_height * len(lines)
-    if text_y - total_height / 2 < 2 / 25.4 * 72 or text_y + total_height / 2 > STICKER_HEIGHT - 2 / 25.4 * 72:
-        raise HTTPException(status_code=400, detail="Move the message away from the label edge")
-    pdf.setFont("DejaVu-Bold", text_size_pt)
-    first_baseline = text_y + (len(lines) - 1) * line_height / 2 - text_size_pt * 0.35
-    for index, text_line in enumerate(lines):
-        line_width = pdfmetrics.stringWidth(text_line, "DejaVu-Bold", text_size_pt)
-        if text_x - line_width / 2 < 2 / 25.4 * 72 or text_x + line_width / 2 > STICKER_WIDTH - 2 / 25.4 * 72:
-            raise HTTPException(status_code=400, detail="Move the message away from the label edge")
-        pdf.drawCentredString(text_x, first_baseline - index * line_height, text_line)
+        line_height = font_size * 1.18
+        total_height = line_height * len(lines)
+        if center_y - total_height / 2 < margin or center_y + total_height / 2 > STICKER_HEIGHT - margin:
+            raise HTTPException(status_code=400, detail="Move the text away from the label edge")
+        pdf.setFont("DejaVu-Bold", font_size)
+        first_baseline = center_y + (len(lines) - 1) * line_height / 2 - font_size * 0.35
+        for index, text_line in enumerate(lines):
+            baseline = first_baseline - index * line_height
+            if element.align == "left":
+                pdf.drawString(left_x, baseline, text_line)
+            elif element.align == "right":
+                pdf.drawRightString(right_x, baseline, text_line)
+            else:
+                pdf.drawCentredString(center_x, baseline, text_line)
 
     pdf.showPage()
     pdf.save()
     return buffer.getvalue()
+
+
+def read_sticker_templates() -> list[StickerTemplate]:
+    with sticker_template_lock:
+        if not STICKER_TEMPLATE_FILE.exists():
+            return []
+        try:
+            stored = json.loads(STICKER_TEMPLATE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(stored, list):
+                raise ValueError("Template storage must contain a list")
+            return [StickerTemplate.model_validate(item) for item in stored]
+        except (OSError, ValueError) as error:
+            logger.exception("Could not read sticker templates")
+            raise HTTPException(status_code=503, detail="Sticker templates could not be read from persistent storage") from error
+
+
+def write_sticker_templates(templates: list[StickerTemplate]) -> None:
+    temporary_path = None
+    with sticker_template_lock:
+        try:
+            STICKER_TEMPLATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=STICKER_TEMPLATE_FILE.parent,
+                prefix=".sticker-templates-",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                json.dump([template.model_dump(mode="json") for template in templates], temporary_file, ensure_ascii=False, indent=2)
+                temporary_file.write("\n")
+            temporary_path.replace(STICKER_TEMPLATE_FILE)
+        except OSError as error:
+            logger.exception("Could not save sticker templates")
+            raise HTTPException(status_code=503, detail="Sticker templates could not be saved; check the service's persistent data volume") from error
+        finally:
+            if temporary_path and temporary_path.exists():
+                temporary_path.unlink(missing_ok=True)
+
 
 
 def _post_home_assistant_webhook(webhook_id: str, action: str) -> None:
@@ -516,6 +594,9 @@ label{display:block;margin:19px 0 7px;font-weight:700;font-size:.92rem}input{fon
 @media(max-width:560px){main{margin:34px auto 46px}.topbar{height:66px}.card{border-radius:20px}.card-head{gap:12px}.card-icon{width:42px;height:42px}#queue{padding:18px;border-radius:18px}.address-grid{grid-template-columns:1fr}.field.full{grid-column:auto}}
 @media(max-width:560px){.sticker-controls{grid-template-columns:1fr}.sticker-canvas{margin:16px auto 20px}}
 dialog{width:min(900px,96vw);height:min(900px,94vh);max-width:none;max-height:none;padding:0;border:1px solid var(--line);border-radius:20px;background:var(--paper);color:var(--ink);box-shadow:0 24px 80px rgba(24,16,12,.28)}dialog::backdrop{background:rgba(24,16,12,.58)}.preview-head{height:62px;padding:0 18px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.preview-head h2{margin:0;font-size:1.2rem}.preview-close{border:0;background:transparent;font-size:1.6rem;cursor:pointer;color:var(--muted)}.preview-frame{display:block;width:100%;height:calc(100% - 116px);border:0;background:#f3f3f3}.preview-foot{min-height:68px;padding:8px 16px;display:flex;align-items:center;justify-content:space-between;gap:14px;color:var(--muted);font-size:.84rem}.preview-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}.preview-print{margin:0;min-height:42px;padding:8px 18px}.preview-print:disabled{opacity:.5;cursor:not-allowed}.preview-message{flex:1;margin:0;min-width:0}.preview-message.error{color:#9b3328}
+
+.template-toolbar{display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr);gap:14px 18px;margin:0 0 18px}.template-actions{display:flex;flex-wrap:wrap;align-items:end;gap:8px;margin-top:18px}.template-name{width:100%;height:44px;padding:8px 12px;border:1px solid #ded8d0;border-radius:12px;background:#fff}.template-select{width:100%;height:48px;padding:8px 12px;border:1px solid #ded8d0;border-radius:12px;background:#fff;font:inherit}.tool-button{min-height:40px;padding:8px 13px;border:1px solid #d8cec1;border-radius:999px;background:#fff;color:var(--ink);font:inherit;font-size:.88rem;font-weight:700;cursor:pointer}.tool-button:hover,.tool-button.active{background:var(--soft)}.tool-button.active{border-color:var(--rose)}.tool-button:disabled{opacity:.45;cursor:not-allowed}.sticker-item.selected{outline:2px dashed #8c503e;outline-offset:3px}.sticker-message-preview{white-space:pre-wrap}.editor-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:4px 0 16px}.editor-toolbar .hint{margin:0 8px 0 0}.editor-controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px}.editor-control[hidden]{display:none!important}.alignment-group{display:flex;gap:6px}.alignment-group .tool-button{min-width:72px}.sticker-template-status{min-height:24px;margin:12px 0 0;color:var(--muted);font-size:.88rem}.sticker-template-status.error{color:#9b3328}
+@media(max-width:560px){.template-toolbar,.editor-controls{grid-template-columns:1fr}.template-actions{align-items:stretch}.template-actions .tool-button{flex:1}}
 </style></head><body>
 <header class="topbar"><a class="brand" href="https://www.littlerose.shop" aria-label="Little Rose"><img src="/static/little-rose-badge.png" alt=""><span>little<em>rose</em></span></a></header>
 <main><p class="eyebrow">Little Rose · Dispatch</p><h1>Print Little Rose labels</h1><p class="intro">Design a small branded sticker or send a 4 × 6 inch label to the Munbyn printer.</p>
@@ -535,12 +616,13 @@ dialog{width:min(900px,96vw);height:min(900px,94vh);max-width:none;max-height:no
 <div class="field full"><label for="website">Website address</label><input class="text-input brand-input" id="website" name="website" value="www.littlerose.shop" maxlength="50" autocomplete="url"></div>
 </div><p class="hint">Preview the label first. From the preview, choose Proceed to print to send it to the Munbyn.</p>
 <div class="actions"><button class="submit" id="preview-label" type="submit">Preview label <span aria-hidden="true">→</span></button></div></form><div id="address-status" role="status" aria-live="polite"></div></section>
-<section class="card" aria-labelledby="sticker-title" style="margin-top:18px"><div class="card-head"><div class="card-icon" aria-hidden="true">✿</div><div><h2 id="sticker-title">Design a Little Rose sticker</h2><p>Arrange your badge and a short message on a 57 × 32 mm label.</p></div></div>
-<form id="sticker-form"><label for="sticker-message">Message</label><input class="text-input" id="sticker-message" name="message" maxlength="56" value="Thank you for your order" required><p class="sticker-instructions">Drag the badge and message on the label to position them. Use the sliders to resize them.</p>
-<div class="sticker-canvas" id="sticker-canvas" aria-label="Interactive 57 by 32 millimetre sticker editor"><img class="sticker-item sticker-badge" id="sticker-badge" src="/static/little-rose-badge-mono.png" alt="Little Rose badge"><div class="sticker-item sticker-message-preview" id="sticker-message-preview">Thank you for your order</div></div>
-<input type="hidden" name="logo_x_mm" id="logo-x" value="15"><input type="hidden" name="logo_y_mm" id="logo-y" value="16"><input type="hidden" name="logo_size_mm" id="logo-size-value" value="14"><input type="hidden" name="text_x_mm" id="text-x" value="39"><input type="hidden" name="text_y_mm" id="text-y" value="16"><input type="hidden" name="text_size_pt" id="text-size-value" value="8">
-<div class="sticker-controls"><label class="sticker-control" for="logo-size">Badge size <output id="logo-size-output">14 mm</output><input type="range" id="logo-size" min="6" max="27" step="1" value="14"></label><label class="sticker-control" for="text-size">Message size <output id="text-size-output">8 pt</output><input type="range" id="text-size" min="5" max="14" step="0.5" value="8"></label><div class="field"><label for="sticker-copies">Copies</label><input class="sticker-copy" id="sticker-copies" name="copies" type="number" min="1" max="10" value="1" required></div></div>
-<button class="submit" id="sticker-preview-button" type="button">Preview sticker <span aria-hidden="true">→</span></button></form><div id="sticker-status" role="status" aria-live="polite"></div></section>
+<section class="card" aria-labelledby="sticker-title" style="margin-top:18px"><div class="card-head"><div class="card-icon" aria-hidden="true">✿</div><div><h2 id="sticker-title">Design a Little Rose sticker</h2><p>Arrange text and the badge on a 57 × 32 mm label. Save designs to reuse them on any device.</p></div></div>
+<div class="template-toolbar"><div><label for="sticker-template-select">Saved designs</label><select class="template-select" id="sticker-template-select"><option value="">New design</option></select></div><div><label for="sticker-template-name">Design name</label><input class="template-name" id="sticker-template-name" maxlength="60" placeholder="e.g. Thank you for your order"></div></div>
+<div class="editor-toolbar"><button class="tool-button" id="add-sticker-text" type="button">＋ Add text</button><button class="tool-button" id="remove-sticker-text" type="button" disabled>Remove selected text</button><p class="hint">Drag an item to move it. Select it to edit its settings.</p></div>
+<div class="sticker-canvas" id="sticker-canvas" aria-label="Interactive 57 by 32 millimetre sticker editor"></div>
+<div class="editor-controls"><div class="editor-control" id="badge-size-control"><label for="badge-size">Badge size <output id="badge-size-output">14 mm</output></label><input type="range" id="badge-size" min="6" max="27" step="1" value="14"></div><div class="editor-control" id="text-content-control" hidden><label for="selected-text">Selected text</label><input class="text-input" id="selected-text" maxlength="56"></div><div class="editor-control" id="text-size-control" hidden><label for="selected-text-size">Text size <output id="selected-text-size-output">8 pt</output></label><input type="range" id="selected-text-size" min="5" max="14" step="0.5" value="8"></div><div class="editor-control" id="text-width-control" hidden><label for="selected-text-width">Text box width <output id="selected-text-width-output">30 mm</output></label><input type="range" id="selected-text-width" min="8" max="53" step="1" value="30"></div><div class="editor-control" id="text-alignment-control" hidden><label>Text alignment</label><div class="alignment-group"><button class="tool-button" type="button" data-text-align="left">Left</button><button class="tool-button" type="button" data-text-align="center">Centre</button><button class="tool-button" type="button" data-text-align="right">Right</button></div></div><div class="editor-control"><label>Position on label</label><div class="alignment-group"><button class="tool-button" type="button" data-position-align="left">Left</button><button class="tool-button" type="button" data-position-align="center">Centre</button><button class="tool-button" type="button" data-position-align="right">Right</button></div></div><div class="editor-control"><label for="sticker-copies">Copies</label><input class="sticker-copy" id="sticker-copies" type="number" min="1" max="10" value="1" required></div></div>
+<div class="template-actions"><button class="tool-button" id="save-template-new" type="button">Save as new</button><button class="tool-button" id="save-template-update" type="button" disabled>Save changes</button><button class="tool-button" id="delete-template" type="button" disabled>Delete saved design</button><button class="tool-button" id="reset-sticker-design" type="button">Reset starter</button></div>
+<button class="submit" id="sticker-preview-button" type="button">Preview sticker <span aria-hidden="true">→</span></button><p class="sticker-template-status" id="sticker-status" role="status" aria-live="polite"></p></section>
 <section class="card" aria-labelledby="pdf-title" style="margin-top:18px"><div class="card-head"><div class="card-icon" aria-hidden="true">↥</div><div><h2 id="pdf-title">Print an existing PDF</h2><p>Use this for carrier labels or other ready-made PDFs.</p></div></div>
 <form id="pdf-form"><label for="pdf">Label PDF</label><input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf" required><p class="hint">PDF only · up to 20 MB</p>
 <label for="pdf-copies">Copies</label><input class="copies" id="pdf-copies" name="copies" type="number" min="1" max="10" value="1" required>
@@ -568,33 +650,85 @@ previewDialog.addEventListener('close',()=>{previewFrame.removeAttribute('src');
 document.querySelector('#preview-close').addEventListener('click',closePreview);document.querySelector('#preview-done').addEventListener('click',closePreview);
 proceedPrintButton.addEventListener('click',async()=>{if(!previewSignature||formSignature(addressForm)!==previewSignature){previewMessage.className='preview-message error';previewMessage.textContent='The details changed. Go back and preview the updated label.';proceedPrintButton.disabled=true;return;}const summary=['recipient-name','address-line-1','address-line-2','town','county','postcode'].map(id=>document.getElementById(id).value.trim()).filter(Boolean).join(String.fromCharCode(10));const copies=document.querySelector('#address-copies').value;if(!window.confirm(`Send this label to the Munbyn printer?\n\n${summary}\n\nCopies: ${copies}`)){previewMessage.className='preview-message';previewMessage.textContent='Printing cancelled. The label has not been sent.';return;}previewMessage.className='preview-message';previewMessage.textContent='Sending the label to the Munbyn…';proceedPrintButton.disabled=true;previewButton.disabled=true;try{const response=await fetch('/api/print-address',{method:'POST',body:new FormData(addressForm)});const body=await response.text();let result={};try{result=JSON.parse(body);}catch{}if(!response.ok)throw new Error(result.detail||body||'Print request failed');closePreview();addressStatus.className='';addressStatus.textContent='Address label sent to the printer. Job: '+result.job_id;for(const id of ['recipient-name','address-line-1','address-line-2','town','county','postcode'])document.getElementById(id).value='';document.querySelector('#address-copies').value='1';previewSignature='';updatePreviewPrintState();}catch(err){previewMessage.className='preview-message error';previewMessage.textContent='Could not print: '+err.message;proceedPrintButton.disabled=false;}finally{previewButton.disabled=false;refreshQueue();}});
 function bindPrintForm(formId,endpoint,statusId,buttonId,successText){const form=document.querySelector(formId),status=document.querySelector(statusId),button=document.querySelector(buttonId);form.addEventListener('submit',async e=>{e.preventDefault();status.className='';status.textContent='Sending to the Munbyn…';button.disabled=true;try{const r=await fetch(endpoint,{method:'POST',body:new FormData(form)}),j=await r.json();if(!r.ok)throw new Error(j.detail||'Print request failed');status.textContent=successText+' Job: '+j.job_id;form.reset();}catch(err){status.className='error';status.textContent='Could not print: '+err.message;}finally{button.disabled=false;refreshQueue();}});}
-const stickerForm=document.querySelector('#sticker-form'),stickerCanvas=document.querySelector('#sticker-canvas'),stickerBadge=document.querySelector('#sticker-badge'),stickerMessage=document.querySelector('#sticker-message-preview'),stickerDialog=document.querySelector('#sticker-preview-dialog'),stickerPreviewFrame=document.querySelector('#sticker-preview-frame'),stickerStatus=document.querySelector('#sticker-status');
-let stickerPreviewUrl='';
-function updateStickerCanvas(){
-  const logoSize=Number(document.querySelector('#logo-size').value),textSize=Number(document.querySelector('#text-size').value),width=stickerCanvas.clientWidth;
-  stickerBadge.style.left=(Number(document.querySelector('#logo-x').value)/57*100)+'%';stickerBadge.style.top=(Number(document.querySelector('#logo-y').value)/32*100)+'%';stickerBadge.style.width=(logoSize/57*100)+'%';
-  stickerMessage.style.left=(Number(document.querySelector('#text-x').value)/57*100)+'%';stickerMessage.style.top=(Number(document.querySelector('#text-y').value)/32*100)+'%';stickerMessage.style.fontSize=(textSize/72*25.4/57*width)+'px';
-  stickerMessage.textContent=document.querySelector('#sticker-message').value||'Your message';
-  document.querySelector('#logo-size-value').value=logoSize;document.querySelector('#text-size-value').value=textSize;
-  document.querySelector('#logo-size-output').textContent=logoSize+' mm';document.querySelector('#text-size-output').textContent=textSize+' pt';
+const stickerCanvas=document.querySelector('#sticker-canvas'),stickerStatus=document.querySelector('#sticker-status');
+const templateSelect=document.querySelector('#sticker-template-select'),templateName=document.querySelector('#sticker-template-name');
+const badgeSize=document.querySelector('#badge-size'),textInput=document.querySelector('#selected-text'),textSize=document.querySelector('#selected-text-size'),textWidth=document.querySelector('#selected-text-width');
+const stickerCopies=document.querySelector('#sticker-copies'),stickerDialog=document.querySelector('#sticker-preview-dialog'),stickerPreviewFrame=document.querySelector('#sticker-preview-frame');
+const stickerMaxElements=10;
+const starterDesign=()=>({elements:[{id:'badge',type:'badge',x_mm:15,y_mm:16,size_mm:14},{id:'text-1',type:'text',text:'Thank you for your order',x_mm:39,y_mm:16,width_mm:30,font_size_pt:8,align:'center'}]});
+let stickerDesign=starterDesign(),stickerTemplates=[],currentTemplateId='',selectedElementId='text-1',stickerPreviewUrl='';
+function selectedStickerElement(){return stickerDesign.elements.find(element=>element.id===selectedElementId)||stickerDesign.elements[0]||null;}
+function setStickerStatus(message,isError=false){stickerStatus.textContent=message;stickerStatus.className='sticker-template-status'+(isError?' error':'');}
+function updateStickerControls(){
+ const element=selectedStickerElement(),isBadge=element?.type==='badge',isText=element?.type==='text';
+ document.querySelector('#badge-size-control').hidden=!isBadge;
+ for(const id of ['text-content-control','text-size-control','text-width-control','text-alignment-control'])document.getElementById(id).hidden=!isText;
+ document.querySelector('#remove-sticker-text').disabled=!isText||stickerDesign.elements.length<=1;
+ document.querySelector('#add-sticker-text').disabled=stickerDesign.elements.length>=stickerMaxElements;
+ document.querySelector('#save-template-update').disabled=!currentTemplateId;
+ document.querySelector('#delete-template').disabled=!currentTemplateId;
+ if(!element)return;
+ if(isBadge){badgeSize.value=element.size_mm;document.querySelector('#badge-size-output').textContent=element.size_mm+' mm';}
+ if(isText){textInput.value=element.text;textSize.value=element.font_size_pt;textWidth.value=element.width_mm;document.querySelector('#selected-text-size-output').textContent=element.font_size_pt+' pt';document.querySelector('#selected-text-width-output').textContent=element.width_mm+' mm';for(const button of document.querySelectorAll('[data-text-align]'))button.classList.toggle('active',button.dataset.textAlign===element.align);}
+ stickerCanvas.querySelectorAll('.sticker-item').forEach(node=>node.classList.toggle('selected',node.dataset.elementId===element.id));
 }
-for(const id of ['sticker-message','logo-size','text-size'])document.getElementById(id).addEventListener('input',updateStickerCanvas);
-function bindStickerDrag(element,xId,yId){
-  element.addEventListener('pointerdown',event=>{event.preventDefault();element.setPointerCapture(event.pointerId);});
-  element.addEventListener('pointermove',event=>{if(!element.hasPointerCapture(event.pointerId))return;const rect=stickerCanvas.getBoundingClientRect();document.getElementById(xId).value=Math.max(0,Math.min(57,(event.clientX-rect.left)/rect.width*57)).toFixed(1);document.getElementById(yId).value=Math.max(0,Math.min(32,(event.clientY-rect.top)/rect.height*32)).toFixed(1);updateStickerCanvas();});
+function renderStickerEditor(){
+ stickerCanvas.replaceChildren();
+ for(const element of stickerDesign.elements){
+  const node=element.type==='badge'?document.createElement('img'):document.createElement('div');
+  node.className='sticker-item '+(element.type==='badge'?'sticker-badge':'sticker-message-preview')+(element.id===selectedElementId?' selected':'');
+  node.dataset.elementId=element.id;node.style.left=(element.x_mm/57*100)+'%';node.style.top=(element.y_mm/32*100)+'%';
+  if(element.type==='badge'){node.src='/static/little-rose-badge-mono.png';node.alt='Little Rose badge';node.draggable=false;node.style.width=(element.size_mm/57*100)+'%';}
+  else{node.textContent=element.text;node.style.width=(element.width_mm/57*100)+'%';node.style.fontSize=(element.font_size_pt/72*25.4/57*stickerCanvas.clientWidth)+'px';node.style.textAlign=element.align;}
+  let dragStart=null;
+  node.addEventListener('pointerdown',event=>{event.preventDefault();selectedElementId=element.id;updateStickerControls();node.setPointerCapture(event.pointerId);dragStart={pointerX:event.clientX,pointerY:event.clientY,x:element.x_mm,y:element.y_mm};});
+  node.addEventListener('pointermove',event=>{if(!dragStart||!node.hasPointerCapture(event.pointerId))return;const rect=stickerCanvas.getBoundingClientRect(),halfWidth=(element.type==='badge'?element.size_mm:element.width_mm)/2,halfHeight=element.type==='badge'?element.size_mm/2:5;element.x_mm=Math.max(2+halfWidth,Math.min(57-2-halfWidth,dragStart.x+(event.clientX-dragStart.pointerX)/rect.width*57));element.y_mm=Math.max(2+halfHeight,Math.min(32-2-halfHeight,dragStart.y+(event.clientY-dragStart.pointerY)/rect.height*32));node.style.left=(element.x_mm/57*100)+'%';node.style.top=(element.y_mm/32*100)+'%';});
+  node.addEventListener('pointerup',()=>{dragStart=null;});node.addEventListener('pointercancel',()=>{dragStart=null;});
+  node.addEventListener('click',()=>{selectedElementId=element.id;updateStickerControls();});
+  stickerCanvas.append(node);
+ }
+ updateStickerControls();
 }
-bindStickerDrag(stickerBadge,'logo-x','logo-y');bindStickerDrag(stickerMessage,'text-x','text-y');window.addEventListener('resize',updateStickerCanvas);updateStickerCanvas();
+function updateSelectedElement(change){const element=selectedStickerElement();if(!element)return;Object.assign(element,change);renderStickerEditor();}
+function stickerDesignPayload(){return {elements:stickerDesign.elements};}
+async function readApiResponse(response){const text=await response.text();let body={};try{body=JSON.parse(text);}catch{}if(!response.ok)throw new Error(body.detail||text||'Request failed');return body;}
+async function refreshStickerTemplates(selectedId=''){
+ const response=await fetch('/api/sticker-templates',{cache:'no-store'}),body=await readApiResponse(response);stickerTemplates=body.templates||[];templateSelect.replaceChildren(new Option('New design',''));
+ for(const template of stickerTemplates)templateSelect.add(new Option(template.name,template.id));
+ templateSelect.value=selectedId||'';
+}
+templateSelect.addEventListener('change',()=>{const template=stickerTemplates.find(item=>item.id===templateSelect.value);if(!template){currentTemplateId='';templateName.value='';stickerDesign=starterDesign();selectedElementId='text-1';renderStickerEditor();setStickerStatus('New unsaved design.');return;}currentTemplateId=template.id;templateName.value=template.name;stickerDesign={elements:structuredClone(template.elements)};selectedElementId=stickerDesign.elements[0]?.id||'';renderStickerEditor();setStickerStatus('Loaded '+template.name+'.');});
+async function saveStickerTemplate(method,url,successMessage){
+ const name=templateName.value.trim();if(!name){templateName.focus();setStickerStatus('Enter a name for this design first.',true);return;}
+ try{const response=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify({name,elements:stickerDesign.elements})}),saved=await readApiResponse(response);currentTemplateId=saved.id;templateName.value=saved.name;await refreshStickerTemplates(currentTemplateId);updateStickerControls();setStickerStatus(successMessage+' '+saved.name+'.');}
+ catch(error){setStickerStatus('Could not save design: '+error.message,true);}
+}
+document.querySelector('#save-template-new').addEventListener('click',()=>saveStickerTemplate('POST','/api/sticker-templates','Saved'));
+document.querySelector('#save-template-update').addEventListener('click',()=>{if(currentTemplateId)saveStickerTemplate('PUT','/api/sticker-templates/'+currentTemplateId,'Updated');});
+document.querySelector('#delete-template').addEventListener('click',async()=>{if(!currentTemplateId||!window.confirm('Delete the saved design “'+templateName.value+'”?'))return;try{await readApiResponse(await fetch('/api/sticker-templates/'+currentTemplateId,{method:'DELETE'}));currentTemplateId='';templateName.value='';stickerDesign=starterDesign();selectedElementId='text-1';await refreshStickerTemplates();renderStickerEditor();setStickerStatus('Saved design deleted.');}catch(error){setStickerStatus('Could not delete design: '+error.message,true);}});
+document.querySelector('#reset-sticker-design').addEventListener('click',()=>{currentTemplateId='';templateSelect.value='';templateName.value='';stickerDesign=starterDesign();selectedElementId='text-1';renderStickerEditor();setStickerStatus('Starter design restored. Save it under a name to keep it.');});
+document.querySelector('#add-sticker-text').addEventListener('click',()=>{if(stickerDesign.elements.length>=stickerMaxElements)return;const id='text-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);stickerDesign.elements.push({id,type:'text',text:'Your text',x_mm:28.5,y_mm:16,width_mm:30,font_size_pt:8,align:'center'});selectedElementId=id;renderStickerEditor();textInput.focus();});
+document.querySelector('#remove-sticker-text').addEventListener('click',()=>{const element=selectedStickerElement();if(!element||element.type!=='text'||stickerDesign.elements.length<=1)return;stickerDesign.elements=stickerDesign.elements.filter(item=>item.id!==element.id);selectedElementId=stickerDesign.elements.find(item=>item.type==='text')?.id||stickerDesign.elements[0]?.id||'';renderStickerEditor();});
+badgeSize.addEventListener('input',()=>{const element=selectedStickerElement();if(element?.type==='badge')updateSelectedElement({size_mm:Number(badgeSize.value)});});
+textInput.addEventListener('input',()=>{const element=selectedStickerElement();if(!element||element.type!=='text')return;element.text=textInput.value;const node=stickerCanvas.querySelector('[data-element-id="'+element.id+'"]');if(node)node.textContent=element.text;});
+textSize.addEventListener('input',()=>{const element=selectedStickerElement();if(element?.type==='text')updateSelectedElement({font_size_pt:Number(textSize.value)});});
+textWidth.addEventListener('input',()=>{const element=selectedStickerElement();if(element?.type==='text')updateSelectedElement({width_mm:Number(textWidth.value)});});
+document.querySelectorAll('[data-text-align]').forEach(button=>button.addEventListener('click',()=>{const element=selectedStickerElement();if(element?.type==='text')updateSelectedElement({align:button.dataset.textAlign});}));
+document.querySelectorAll('[data-position-align]').forEach(button=>button.addEventListener('click',()=>{const element=selectedStickerElement();if(!element)return;const width=element.type==='badge'?element.size_mm:element.width_mm,margin=2;const x=button.dataset.positionAlign==='left'?margin+width/2:button.dataset.positionAlign==='right'?57-margin-width/2:28.5;updateSelectedElement({x_mm:x});}));
+window.addEventListener('resize',renderStickerEditor);renderStickerEditor();refreshStickerTemplates().catch(error=>setStickerStatus('Could not load saved designs: '+error.message,true));
 document.querySelector('#sticker-preview-button').addEventListener('click',async()=>{
-  if(!stickerForm.reportValidity())return;const button=document.querySelector('#sticker-preview-button');button.disabled=true;stickerStatus.className='';stickerStatus.textContent='Preparing sticker preview…';
-  try{const response=await fetch('/api/preview-sticker',{method:'POST',body:new FormData(stickerForm)});if(!response.ok){const body=await response.text();let message=body;try{message=JSON.parse(body).detail||body;}catch{}throw new Error(message||'Could not create preview');}const blob=await response.blob();if(!blob.type.includes('pdf'))throw new Error('The server did not return a PDF preview.');if(stickerPreviewUrl)URL.revokeObjectURL(stickerPreviewUrl);stickerPreviewUrl=URL.createObjectURL(blob);stickerPreviewFrame.src=stickerPreviewUrl;document.querySelector('#sticker-preview-status').textContent='Check the design and label size, then choose Print sticker.';stickerStatus.textContent='Preview ready.';stickerDialog.showModal();}catch(error){stickerStatus.className='error';stickerStatus.textContent='Could not create preview: '+error.message;}finally{button.disabled=false;}
+ const copies=Number(stickerCopies.value);if(!stickerCopies.reportValidity()||copies<1||copies>10)return;const button=document.querySelector('#sticker-preview-button');button.disabled=true;setStickerStatus('Preparing sticker preview…');
+ try{const response=await fetch('/api/preview-sticker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(stickerDesignPayload())});if(!response.ok)await readApiResponse(response);const blob=await response.blob();if(!blob.type.includes('pdf'))throw new Error('The server did not return a PDF preview.');if(stickerPreviewUrl)URL.revokeObjectURL(stickerPreviewUrl);stickerPreviewUrl=URL.createObjectURL(blob);stickerPreviewFrame.src=stickerPreviewUrl;document.querySelector('#sticker-preview-status').textContent='Check the design and label size, then choose Print sticker.';setStickerStatus('Preview ready.');stickerDialog.showModal();}
+ catch(error){setStickerStatus('Could not create preview: '+error.message,true);}finally{button.disabled=false;}
 });
 function closeStickerPreview(){if(stickerDialog.open)stickerDialog.close();}
 stickerDialog.addEventListener('close',()=>{stickerPreviewFrame.removeAttribute('src');if(stickerPreviewUrl)URL.revokeObjectURL(stickerPreviewUrl);stickerPreviewUrl='';});
 document.querySelector('#sticker-preview-close').addEventListener('click',closeStickerPreview);document.querySelector('#sticker-preview-back').addEventListener('click',closeStickerPreview);
 document.querySelector('#sticker-print').addEventListener('click',async()=>{
-  const message=document.querySelector('#sticker-message').value.trim(),copies=document.querySelector('#sticker-copies').value;if(!window.confirm(`Send this 57 × 32 mm sticker to the Munbyn?\n\n${message}\n\nCopies: ${copies}`))return;
-  const button=document.querySelector('#sticker-print');button.disabled=true;document.querySelector('#sticker-preview-status').textContent='Sending sticker to the Munbyn…';
-  try{const response=await fetch('/api/print-sticker',{method:'POST',body:new FormData(stickerForm)}),body=await response.text();let result={};try{result=JSON.parse(body);}catch{}if(!response.ok)throw new Error(result.detail||body||'Print request failed');closeStickerPreview();stickerStatus.className='';stickerStatus.textContent='Sticker sent to the printer. Job: '+result.job_id;refreshQueue();}catch(error){document.querySelector('#sticker-preview-status').className='preview-message error';document.querySelector('#sticker-preview-status').textContent='Could not print: '+error.message;}finally{button.disabled=false;}
+ const copies=Number(stickerCopies.value);if(!stickerCopies.reportValidity()||copies<1||copies>10)return;const textSummary=stickerDesign.elements.filter(element=>element.type==='text').map(element=>element.text).join(' · ');const confirmation=['Send this 57 × 32 mm sticker to the Munbyn?',textSummary,'Copies: '+copies].join(String.fromCharCode(10)+String.fromCharCode(10));if(!window.confirm(confirmation))return;
+ const button=document.querySelector('#sticker-print');button.disabled=true;document.querySelector('#sticker-preview-status').textContent='Sending sticker to the Munbyn…';
+ try{const response=await fetch('/api/print-sticker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...stickerDesignPayload(),copies})}),result=await readApiResponse(response);closeStickerPreview();setStickerStatus('Sticker sent to the printer. Job: '+result.job_id);refreshQueue();}
+ catch(error){document.querySelector('#sticker-preview-status').className='preview-message error';document.querySelector('#sticker-preview-status').textContent='Could not print: '+error.message;}finally{button.disabled=false;}
 });
 bindPrintForm('#pdf-form','/api/print-from-page','#pdf-status','#pdf-submit','PDF sent to the printer.');
 </script></body></html>""")
@@ -674,19 +808,57 @@ async def print_address_from_page(
     return await submit_bytes_with_power(label_pdf, copies)
 
 
-@app.post("/api/preview-sticker")
-async def preview_sticker_from_page(
-    request: Request,
-    message: str = Form(...),
-    logo_x_mm: float = Form(15),
-    logo_y_mm: float = Form(16),
-    logo_size_mm: float = Form(14),
-    text_x_mm: float = Form(39),
-    text_y_mm: float = Form(16),
-    text_size_pt: float = Form(8),
-):
+@app.get("/api/sticker-templates")
+def list_sticker_templates(request: Request):
     validate_page_origin(request)
-    pdf_data = create_sticker_pdf(message, logo_x_mm, logo_y_mm, logo_size_mm, text_x_mm, text_y_mm, text_size_pt)
+    return {"templates": [template.model_dump(mode="json") for template in read_sticker_templates()]}
+
+
+@app.post("/api/sticker-templates", status_code=201)
+def create_sticker_template(request: Request, payload: StickerTemplateRequest):
+    validate_page_origin(request)
+    template = StickerTemplate(id=uuid4().hex, **payload.model_dump())
+    with sticker_template_lock:
+        templates = read_sticker_templates()
+        templates.append(template)
+        write_sticker_templates(templates)
+    return template.model_dump(mode="json")
+
+
+@app.put("/api/sticker-templates/{template_id}")
+def update_sticker_template(request: Request, template_id: str, payload: StickerTemplateRequest):
+    validate_page_origin(request)
+    if not re.fullmatch(r"[a-f0-9]{32}", template_id):
+        raise HTTPException(status_code=400, detail="Invalid template ID")
+    with sticker_template_lock:
+        templates = read_sticker_templates()
+        for index, existing in enumerate(templates):
+            if existing.id == template_id:
+                template = StickerTemplate(id=template_id, **payload.model_dump())
+                templates[index] = template
+                write_sticker_templates(templates)
+                return template.model_dump(mode="json")
+    raise HTTPException(status_code=404, detail="Sticker template not found")
+
+
+@app.delete("/api/sticker-templates/{template_id}")
+def delete_sticker_template(request: Request, template_id: str):
+    validate_page_origin(request)
+    if not re.fullmatch(r"[a-f0-9]{32}", template_id):
+        raise HTTPException(status_code=400, detail="Invalid template ID")
+    with sticker_template_lock:
+        templates = read_sticker_templates()
+        remaining = [template for template in templates if template.id != template_id]
+        if len(remaining) == len(templates):
+            raise HTTPException(status_code=404, detail="Sticker template not found")
+        write_sticker_templates(remaining)
+    return {"deleted": True}
+
+
+@app.post("/api/preview-sticker")
+async def preview_sticker_from_page(request: Request, payload: StickerDesignRequest):
+    validate_page_origin(request)
+    pdf_data = create_sticker_pdf(payload.elements)
     return Response(
         content=pdf_data,
         media_type="application/pdf",
@@ -695,22 +867,10 @@ async def preview_sticker_from_page(
 
 
 @app.post("/api/print-sticker")
-async def print_sticker_from_page(
-    request: Request,
-    message: str = Form(...),
-    logo_x_mm: float = Form(15),
-    logo_y_mm: float = Form(16),
-    logo_size_mm: float = Form(14),
-    text_x_mm: float = Form(39),
-    text_y_mm: float = Form(16),
-    text_size_pt: float = Form(8),
-    copies: int = Form(1),
-):
+async def print_sticker_from_page(request: Request, payload: StickerPrintRequest):
     validate_page_origin(request)
-    if not 1 <= copies <= 10:
-        raise HTTPException(status_code=400, detail="Copies must be between 1 and 10")
-    pdf_data = create_sticker_pdf(message, logo_x_mm, logo_y_mm, logo_size_mm, text_x_mm, text_y_mm, text_size_pt)
-    return await submit_bytes_with_power(pdf_data, copies, "media=Custom.57x32mm")
+    pdf_data = create_sticker_pdf(payload.elements)
+    return await submit_bytes_with_power(pdf_data, payload.copies, "media=Custom.57x32mm")
 
 
 @app.post("/api/preview-address")
