@@ -116,6 +116,7 @@ class StickerElementRequest(BaseModel):
 
     id: str = Field(min_length=1, max_length=40)
     type: Literal["badge", "text"]
+    logo: Literal["flower", "wordmark"] = "flower"
     x_mm: float = Field(ge=0, le=57)
     y_mm: float = Field(ge=0, le=32)
     size_mm: float = Field(default=14, ge=6, le=27)
@@ -305,7 +306,7 @@ def create_sticker_pdf(elements: list[StickerElementRequest]) -> bytes:
     pdf.setAuthor("Little Rose")
     pdf.setFillColor(black)
     margin = 2 / 25.4 * 72
-    logo = Path(__file__).parent / "static" / "little-rose-badge-mono.png"
+    logo_files = {"flower": "little-rose-badge-mono.png", "wordmark": "little-rose-wordmark-mono.png"}
 
     for element in elements:
         values = (element.x_mm, element.y_mm, element.size_mm, element.width_mm, element.font_size_pt)
@@ -320,6 +321,7 @@ def create_sticker_pdf(elements: list[StickerElementRequest]) -> bytes:
                 raise HTTPException(status_code=400, detail="Move the badge away from the label edge")
             if center_y - size / 2 < margin or center_y + size / 2 > STICKER_HEIGHT - margin:
                 raise HTTPException(status_code=400, detail="Move the badge away from the label edge")
+            logo = Path(__file__).parent / "static" / logo_files[element.logo]
             pdf.drawImage(
                 ImageReader(str(logo)),
                 center_x - size / 2,
@@ -620,7 +622,7 @@ dialog{width:min(900px,96vw);height:min(900px,94vh);max-width:none;max-height:no
 <div class="template-toolbar"><div><label for="sticker-template-select">Saved designs</label><select class="template-select" id="sticker-template-select"><option value="">New design</option></select></div><div><label for="sticker-template-name">Design name</label><input class="template-name" id="sticker-template-name" maxlength="60" placeholder="e.g. Thank you for your order"></div></div>
 <div class="editor-toolbar"><button class="tool-button" id="add-sticker-text" type="button">＋ Add text</button><button class="tool-button" id="remove-sticker-text" type="button" disabled>Remove selected text</button><p class="hint">Drag an item to move it. Select it to edit its settings.</p></div>
 <div class="sticker-canvas" id="sticker-canvas" aria-label="Interactive 57 by 32 millimetre sticker editor"></div>
-<div class="editor-controls"><div class="editor-control" id="badge-size-control"><label for="badge-size">Badge size <output id="badge-size-output">14 mm</output></label><input type="range" id="badge-size" min="6" max="27" step="1" value="14"></div><div class="editor-control" id="text-content-control" hidden><label for="selected-text">Selected text</label><input class="text-input" id="selected-text" maxlength="56"></div><div class="editor-control" id="text-size-control" hidden><label for="selected-text-size">Text size <output id="selected-text-size-output">8 pt</output></label><input type="range" id="selected-text-size" min="5" max="14" step="0.5" value="8"></div><div class="editor-control" id="text-width-control" hidden><label for="selected-text-width">Text box width <output id="selected-text-width-output">30 mm</output></label><input type="range" id="selected-text-width" min="8" max="53" step="1" value="30"></div><div class="editor-control" id="text-alignment-control" hidden><label>Text alignment</label><div class="alignment-group"><button class="tool-button" type="button" data-text-align="left">Left</button><button class="tool-button" type="button" data-text-align="center">Centre</button><button class="tool-button" type="button" data-text-align="right">Right</button></div></div><div class="editor-control"><label>Position on label</label><div class="alignment-group"><button class="tool-button" type="button" data-position-align="left">Left</button><button class="tool-button" type="button" data-position-align="center">Centre</button><button class="tool-button" type="button" data-position-align="right">Right</button></div></div><div class="editor-control"><label for="sticker-copies">Copies</label><input class="sticker-copy" id="sticker-copies" type="number" min="1" max="10" value="1" required></div></div>
+<div class="editor-controls"><div class="editor-control" id="badge-logo-control"><label for="badge-logo">Logo</label><select class="template-select" id="badge-logo"><option value="flower">Flower badge</option><option value="wordmark">Little Rose script</option></select></div><div class="editor-control" id="badge-size-control"><label for="badge-size">Badge size <output id="badge-size-output">14 mm</output></label><input type="range" id="badge-size" min="6" max="27" step="1" value="14"></div><div class="editor-control" id="text-content-control" hidden><label for="selected-text">Selected text</label><input class="text-input" id="selected-text" maxlength="56"></div><div class="editor-control" id="text-size-control" hidden><label for="selected-text-size">Text size <output id="selected-text-size-output">8 pt</output></label><input type="range" id="selected-text-size" min="5" max="14" step="0.5" value="8"></div><div class="editor-control" id="text-width-control" hidden><label for="selected-text-width">Text box width <output id="selected-text-width-output">30 mm</output></label><input type="range" id="selected-text-width" min="8" max="53" step="1" value="30"></div><div class="editor-control" id="text-alignment-control" hidden><label>Text alignment</label><div class="alignment-group"><button class="tool-button" type="button" data-text-align="left">Left</button><button class="tool-button" type="button" data-text-align="center">Centre</button><button class="tool-button" type="button" data-text-align="right">Right</button></div></div><div class="editor-control"><label>Position on label</label><div class="alignment-group"><button class="tool-button" type="button" data-position-align="left">Left</button><button class="tool-button" type="button" data-position-align="center">Centre</button><button class="tool-button" type="button" data-position-align="right">Right</button></div></div><div class="editor-control"><label for="sticker-copies">Copies</label><input class="sticker-copy" id="sticker-copies" type="number" min="1" max="10" value="1" required></div></div>
 <div class="template-actions"><button class="tool-button" id="save-template-new" type="button">Save as new</button><button class="tool-button" id="save-template-update" type="button" disabled>Save changes</button><button class="tool-button" id="delete-template" type="button" disabled>Delete saved design</button><button class="tool-button" id="reset-sticker-design" type="button">Reset starter</button></div>
 <button class="submit" id="sticker-preview-button" type="button">Preview sticker <span aria-hidden="true">→</span></button><p class="sticker-template-status" id="sticker-status" role="status" aria-live="polite"></p></section>
 <section class="card" aria-labelledby="pdf-title" style="margin-top:18px"><div class="card-head"><div class="card-icon" aria-hidden="true">↥</div><div><h2 id="pdf-title">Print an existing PDF</h2><p>Use this for carrier labels or other ready-made PDFs.</p></div></div>
@@ -652,15 +654,16 @@ proceedPrintButton.addEventListener('click',async()=>{if(!previewSignature||form
 function bindPrintForm(formId,endpoint,statusId,buttonId,successText){const form=document.querySelector(formId),status=document.querySelector(statusId),button=document.querySelector(buttonId);form.addEventListener('submit',async e=>{e.preventDefault();status.className='';status.textContent='Sending to the Munbyn…';button.disabled=true;try{const r=await fetch(endpoint,{method:'POST',body:new FormData(form)}),j=await r.json();if(!r.ok)throw new Error(j.detail||'Print request failed');status.textContent=successText+' Job: '+j.job_id;form.reset();}catch(err){status.className='error';status.textContent='Could not print: '+err.message;}finally{button.disabled=false;refreshQueue();}});}
 const stickerCanvas=document.querySelector('#sticker-canvas'),stickerStatus=document.querySelector('#sticker-status');
 const templateSelect=document.querySelector('#sticker-template-select'),templateName=document.querySelector('#sticker-template-name');
-const badgeSize=document.querySelector('#badge-size'),textInput=document.querySelector('#selected-text'),textSize=document.querySelector('#selected-text-size'),textWidth=document.querySelector('#selected-text-width');
+const badgeSize=document.querySelector('#badge-size'),badgeLogo=document.querySelector('#badge-logo'),textInput=document.querySelector('#selected-text'),textSize=document.querySelector('#selected-text-size'),textWidth=document.querySelector('#selected-text-width');
 const stickerCopies=document.querySelector('#sticker-copies'),stickerDialog=document.querySelector('#sticker-preview-dialog'),stickerPreviewFrame=document.querySelector('#sticker-preview-frame');
 const stickerMaxElements=10;
-const starterDesign=()=>({elements:[{id:'badge',type:'badge',x_mm:15,y_mm:16,size_mm:14},{id:'text-1',type:'text',text:'Thank you for your order',x_mm:39,y_mm:16,width_mm:30,font_size_pt:8,align:'center'}]});
+const starterDesign=()=>({elements:[{id:'badge',type:'badge',logo:'flower',x_mm:15,y_mm:16,size_mm:14},{id:'text-1',type:'text',text:'Thank you for your order',x_mm:39,y_mm:16,width_mm:30,font_size_pt:8,align:'center'}]});
 let stickerDesign=starterDesign(),stickerTemplates=[],currentTemplateId='',selectedElementId='text-1',stickerPreviewUrl='';
 function selectedStickerElement(){return stickerDesign.elements.find(element=>element.id===selectedElementId)||stickerDesign.elements[0]||null;}
 function setStickerStatus(message,isError=false){stickerStatus.textContent=message;stickerStatus.className='sticker-template-status'+(isError?' error':'');}
 function updateStickerControls(){
  const element=selectedStickerElement(),isBadge=element?.type==='badge',isText=element?.type==='text';
+ document.querySelector('#badge-logo-control').hidden=!isBadge;
  document.querySelector('#badge-size-control').hidden=!isBadge;
  for(const id of ['text-content-control','text-size-control','text-width-control','text-alignment-control'])document.getElementById(id).hidden=!isText;
  document.querySelector('#remove-sticker-text').disabled=!isText||stickerDesign.elements.length<=1;
@@ -668,7 +671,7 @@ function updateStickerControls(){
  document.querySelector('#save-template-update').disabled=!currentTemplateId;
  document.querySelector('#delete-template').disabled=!currentTemplateId;
  if(!element)return;
- if(isBadge){badgeSize.value=element.size_mm;document.querySelector('#badge-size-output').textContent=element.size_mm+' mm';}
+ if(isBadge){badgeLogo.value=element.logo||'flower';badgeSize.value=element.size_mm;document.querySelector('#badge-size-output').textContent=element.size_mm+' mm';}
  if(isText){textInput.value=element.text;textSize.value=element.font_size_pt;textWidth.value=element.width_mm;document.querySelector('#selected-text-size-output').textContent=element.font_size_pt+' pt';document.querySelector('#selected-text-width-output').textContent=element.width_mm+' mm';for(const button of document.querySelectorAll('[data-text-align]'))button.classList.toggle('active',button.dataset.textAlign===element.align);}
  stickerCanvas.querySelectorAll('.sticker-item').forEach(node=>node.classList.toggle('selected',node.dataset.elementId===element.id));
 }
@@ -678,7 +681,7 @@ function renderStickerEditor(){
   const node=element.type==='badge'?document.createElement('img'):document.createElement('div');
   node.className='sticker-item '+(element.type==='badge'?'sticker-badge':'sticker-message-preview')+(element.id===selectedElementId?' selected':'');
   node.dataset.elementId=element.id;node.style.left=(element.x_mm/57*100)+'%';node.style.top=(element.y_mm/32*100)+'%';
-  if(element.type==='badge'){node.src='/static/little-rose-badge-mono.png';node.alt='Little Rose badge';node.draggable=false;node.style.width=(element.size_mm/57*100)+'%';}
+  if(element.type==='badge'){node.src=element.logo==='wordmark'?'/static/little-rose-wordmark-mono.png':'/static/little-rose-badge-mono.png';node.alt='Little Rose badge';node.draggable=false;node.style.width=(element.size_mm/57*100)+'%';}
   else{node.textContent=element.text;node.style.width=(element.width_mm/57*100)+'%';node.style.fontSize=(element.font_size_pt/72*25.4/57*stickerCanvas.clientWidth)+'px';node.style.textAlign=element.align;}
   let dragStart=null;
   node.addEventListener('pointerdown',event=>{event.preventDefault();selectedElementId=element.id;updateStickerControls();node.setPointerCapture(event.pointerId);dragStart={pointerX:event.clientX,pointerY:event.clientY,x:element.x_mm,y:element.y_mm};});
@@ -710,6 +713,7 @@ document.querySelector('#reset-sticker-design').addEventListener('click',()=>{cu
 document.querySelector('#add-sticker-text').addEventListener('click',()=>{if(stickerDesign.elements.length>=stickerMaxElements)return;const id='text-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);stickerDesign.elements.push({id,type:'text',text:'Your text',x_mm:28.5,y_mm:16,width_mm:30,font_size_pt:8,align:'center'});selectedElementId=id;renderStickerEditor();textInput.focus();});
 document.querySelector('#remove-sticker-text').addEventListener('click',()=>{const element=selectedStickerElement();if(!element||element.type!=='text'||stickerDesign.elements.length<=1)return;stickerDesign.elements=stickerDesign.elements.filter(item=>item.id!==element.id);selectedElementId=stickerDesign.elements.find(item=>item.type==='text')?.id||stickerDesign.elements[0]?.id||'';renderStickerEditor();});
 badgeSize.addEventListener('input',()=>{const element=selectedStickerElement();if(element?.type==='badge')updateSelectedElement({size_mm:Number(badgeSize.value)});});
+badgeLogo.addEventListener('change',()=>{const element=selectedStickerElement();if(element?.type==='badge')updateSelectedElement({logo:badgeLogo.value});});
 textInput.addEventListener('input',()=>{const element=selectedStickerElement();if(!element||element.type!=='text')return;element.text=textInput.value;const node=stickerCanvas.querySelector('[data-element-id="'+element.id+'"]');if(node)node.textContent=element.text;});
 textSize.addEventListener('input',()=>{const element=selectedStickerElement();if(element?.type==='text')updateSelectedElement({font_size_pt:Number(textSize.value)});});
 textWidth.addEventListener('input',()=>{const element=selectedStickerElement();if(element?.type==='text')updateSelectedElement({width_mm:Number(textWidth.value)});});
